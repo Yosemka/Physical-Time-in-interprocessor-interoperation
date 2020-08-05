@@ -1,0 +1,549 @@
+/* -*- Mode: C; indent-tabs-mode: t; c-basic-offset: 4; tab-width: 4 -*-  */
+/*
+ * main.c
+ * Copyright (C) 2020 Linux <linux@linux-VirtualBox>
+ * 
+ * Pipes is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * Pipes is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License along
+ * with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+
+#include "ipc.h"
+#include "common.h"
+#include "pa2345.h"
+#include "process.h"
+
+//прототипы
+int CheckOptionAndGetValue(int, char**);
+void CreatePipes(int, FILE*);
+void CreateChilds(int);
+void WriteEventLog(const char *, FILE *, ...);
+void WritePipeLog(FILE *, int, int, char*, int);
+char IsOnlyDigits(char* str);
+
+pid_t pid = 1;	
+int pidBalance[MAX_PROCESS_ID];
+
+int main(int argc, char *argv[])
+{
+	printf("I am %d parent process\n", (int)getpid());
+	chProcAmount = 0;
+
+	currentID = 0;
+	pid_t childPID[MAX_PROCESS_ID];
+
+	
+	if((chProcAmount = CheckOptionAndGetValue(argc, argv)) <= 0)
+	{
+		printf("Must specify -p option...");
+		exit(1);
+	}
+
+	//Создание дескрипторов файлов для логирования pipe и events		
+	FILE *fileEv, *filePipe;	
+
+	//Открытие файла для добавления логов каналов
+	filePipe = fopen(pipes_log, "w");
+	
+	//Создание pipe-ов каналов, pipe[Из][Куда] 
+	//например pipe[1][2] передает от доч.проц. 1 в доч.проц. 2
+
+	CreatePipes(chProcAmount, filePipe);	
+
+	fclose(filePipe);
+
+	filePipe = fopen(pipes_log, "a");
+	//Открытие файла для добавления логов событий
+	fileEv = fopen(events_log, "a");
+	
+	//Создание дочерних процессов
+	for(int i = 1; i <= chProcAmount; i++)
+	{
+		pid = fork();	//Возвращает PID дочернего процесса, если он все еще в родительском процессе		
+			if(pid == -1)	//Не удалось создать дочерний процесс
+			{	
+				printf("Error on creating child %d. Exiting...\n", i);//amount);
+				_exit(0);
+			}
+			//Выполняется в дочернем процессе
+			if(pid == 0)	//Сейчас в дочернем процессе
+			{
+				currentID = i;	//currentID хранит локальный id процесса
+				break;			//выйти из цикла, ибо в дочернем незачем создавать процессы
+			}
+		printf("Child %d was created %d\n", i, pid);
+		childPID[i-1] = pid;
+	}
+
+	//2 дочерних -> 6 каналов, 
+	for(int i = 0; i <= chProcAmount; i++)
+	{
+		for(int j = 0; j <= chProcAmount; j++)
+		{
+			if(i != currentID && i != j)
+			{
+				//Например, в дочернем процессе currentID = 2 
+				//Закрыть pipe[0][1], pipe[1][0]  на запись
+				close(pipes[i][j].field[WRITE]);
+				WritePipeLog (filePipe, i, j, "WRITE", (int)getpid());
+			}
+			if(j != currentID && i != j)
+			{
+				//Например, в дочернем процессе currentID = 2 
+				//Закрыть pipe[1][0], pipe[0][1]  на чтение
+				close(pipes[i][j].field[READ]);
+				WritePipeLog (filePipe, i, j, "READ", (int)getpid());
+			}
+		}
+	}
+	///В дочернем процессе
+	if(pid == 0)	//Один из дочерних процессов
+	{			
+		Message msg;
+		TransferOrder *receivedOrder;
+		BalanceState balance = {pidBalance[currentID], get_physical_time(), 0};
+		BalanceHistory history = {currentID, 0, };
+		history.s_history[0] = balance;
+		int resultStarted = 0;
+		int resultDone = 0;
+		
+		printf("I am %d child with PID %d and balance %d\n", currentID, (int)getpid(), balance.s_balance);	
+		
+		WriteEventLog(log_started_fmt, fileEv, get_physical_time (), currentID, (int)getpid(), (int)getppid(), balance.s_balance);
+
+		Message msgStart = { {MESSAGE_MAGIC, strlen(""), STARTED, 0}, ""};
+		//Рассылка всем процессам сообщений STARTED из текущего дочернего процесса		
+		if(send_multicast(&currentID, &msgStart) == UNSUCCESS)
+		{
+			exit(UNSUCCESS);
+		}
+
+		for(int i = 1; i <= chProcAmount; i++)
+		{
+			if(currentID != i)	//чтобы не считывать с pipe[1][1], например
+			{	
+				printf("Trying to read from ch[%d] currentID = %d\n", i, currentID);
+
+				//Чтение сообщений TRANSFER с род. проц.
+				//receive возвращает msg.s_header.s_type
+				if(receive(&currentID, i, &msg) == STARTED)
+				{
+					resultStarted++;	//увеличение счетчика сообщений STARTED от доч. проц.
+				}
+			}
+		}
+		
+		//Проверка на получение всех сообщений STARTED
+		if(resultStarted == chProcAmount - 1)
+		{	
+			printf("CHILD %d recieved ALL STARTED messages\n", currentID);
+			//Запись событий "Получены все STARTED" и ...		
+			WriteEventLog(log_received_all_started_fmt, fileEv, get_physical_time (), currentID);
+			balance_t dif = 0;
+			timestamp_t curtime = get_physical_time();
+			while(1)
+			{
+				curtime = get_physical_time ();
+				if(curtime - balance.s_time > 1)
+				{
+					for(int i = balance.s_time; i < curtime; i++)
+					{
+						balance.s_time += 1;
+						history.s_history_len += 1;	
+						history.s_history[(int)history.s_history_len] = balance;
+					}
+				}
+				
+				balance.s_balance += dif;
+				balance.s_time = curtime;
+				history.s_history_len += 1;	
+				history.s_history[(int)history.s_history_len] = balance;
+				dif = 0;
+				
+				if(receive_any (&currentID, &msg) == UNSUCCESS)
+				{
+					exit(UNSUCCESS);
+				}
+				else
+				{
+					receivedOrder = (TransferOrder*)msg.s_payload;
+					//curtime = 
+					
+					printf("TYPE %s MAGIC %X\n", messageType[msg.s_header.s_type], msg.s_header.s_magic);
+					if(msg.s_header.s_type == TRANSFER)
+					{
+						
+						if(receivedOrder->s_src == currentID)
+						{	//текущий процесс является отправителем
+
+							WriteEventLog(log_transfer_out_fmt, fileEv, get_physical_time (), currentID, receivedOrder->s_amount, receivedOrder->s_dst);
+							send(&currentID, receivedOrder->s_dst, &msg);
+
+							/*if(difSend == 0)
+								difSend = receivedOrder->s_amount;
+							else
+							{
+								balance.s_balance -= difSend;
+								difSend = 0;
+							}*/
+							//balance.s_balance -= receivedOrder->s_amount;
+							//balance.s_time = curtime;
+							//Balance changing
+							
+							dif = -receivedOrder->s_amount;
+							
+							//History changing
+							/*history.s_history_len += 1;	
+							printf("CHILD %d history.s_history_len %d ", currentID, history.s_history_len);
+							history.s_history[(int)history.s_history_len] = balance;*/
+						}
+						else if(receivedOrder->s_dst == currentID)
+						{	//текущий процесс является получателем перевода
+
+							WriteEventLog(log_transfer_in_fmt, fileEv, get_physical_time (), currentID, receivedOrder->s_amount, receivedOrder->s_src);
+
+							/*if(difRec == 0)
+								difRec = receivedOrder->s_amount;
+							else
+							{
+								balance.s_balance += difRec;
+								difRec = 0;
+							}*/
+							
+							//balance.s_balance += receivedOrder->s_amount;
+
+							//curtime = get_physical_time ();
+
+							//Balance changing
+							//balance.s_time = curtime;
+							dif = receivedOrder->s_amount;
+							
+							//History changing
+							//history.s_history_len += 1;
+							//history.s_history[history.s_history_len] = balance;
+
+							Message ackMsg = {{MESSAGE_MAGIC, 0, ACK, get_physical_time()}, };
+							send(&currentID, PARENT_ID, &ackMsg);
+						}
+
+						
+						//tmpBalance = history.s_history[history.s_history_len];
+						//printf("+++++++ %d +++++++++++ Balance AFTER update = %d, time = %d, history_len = %d\n", currentID, tmpBalance.s_balance, tmpBalance.s_time, history.s_history_len);
+					}
+					
+
+					if(msg.s_header.s_type == STOP)
+					{	//получено сообщени СТОП от родителя
+						Message doneMsg = {{MESSAGE_MAGIC, 0, DONE, get_physical_time()}, };
+						send_multicast (&currentID, &doneMsg);
+						//"Доч. проц. заверши "полезную" работу" в лог-файл	
+						WriteEventLog(log_done_fmt, fileEv, get_physical_time (), currentID, balance.s_balance);
+					}
+					else if(msg.s_header.s_type == DONE)
+					{
+						resultDone++;	//увеличение счетчика сообщений DONE от доч. проц.
+						//Проверка на получение всех сообщений DONE
+						if(resultDone == chProcAmount - 1)
+						{
+							//Запись в лог-файл
+							WriteEventLog(log_received_all_done_fmt, fileEv, get_physical_time (), currentID);
+							printf("CHILD %d recieved ALL DONE messages and can go home\n", currentID);
+
+
+							printf("CHILD %d sending Balance History to parent\n", currentID);
+							
+							Message historyMsg = {{MESSAGE_MAGIC, sizeof(BalanceState) * history.s_history_len + 
+									sizeof(history.s_id) + sizeof(history.s_history_len), BALANCE_HISTORY, get_physical_time()}, };
+
+							memmove(&historyMsg.s_payload, &history, sizeof(BalanceState) * history.s_history_len + 
+									sizeof(history.s_id) + sizeof(history.s_history_len));
+
+							printf("\n--------------CHILD %d---------------\n", currentID);
+							for(int i = 0; i < history.s_history_len; i++)
+							{
+								printf("Balance = %d, time = %d\n", history.s_history[i].s_balance, history.s_history[i].s_time);
+							}
+							printf("--------------CHILD %d---------------\n\n", currentID);
+							
+							//memcpy(&historyMsg.s_payload, &tmpHist, sizeof(tmpHist));//sizeof(currentID) + sizeof(history.s_history_len) + sizeof(history.s_history));
+							
+							
+							//memcpy(&historyMsg.s_payload + sizeof(history.s_id) + sizeof(history.s_history_len), &tmpHist, sizeof(history.s_history_len)*sizeof(BalanceState));
+
+							send (&currentID, PARENT_ID, &historyMsg);
+							
+							exit(SUCCESS);	//завершение текущего доч. проц. с кодом 0 (SUCCESS)		
+						}
+					}
+				}
+				
+			}//while(1)
+		}
+	}
+	else //pid != 0 => родительский процесс
+	if(PARENT_ID == currentID)	//Родительский процесс
+	{
+		printf("Waiting child process ending...\n");
+		AllHistory allHistory;
+
+		int countStarted = 0;
+		int countDone = 0;
+		int countHistory = 0;
+		Message msg;
+		int done = 0;		
+		
+		//Получение STARTED сообщений от дочерних процессов
+		for(int i = 1; i <= chProcAmount; i++)
+		{			//currentID = 0		
+			if(receive(&currentID, i, &msg) == STARTED)
+			{
+				countStarted++;		//увеличение счетчика сообщений STARTED от доч. проц.
+				printf("PARENT received STARTED from CHILD %d\n", i);
+			}
+		}
+		
+		//Проверка получения STARTED от всех дочерних процессов
+		if(countStarted == chProcAmount)
+		{
+			//WriteEventLog(log_received_all_started_fmt, fileEv, currentID);
+			printf("PARENT received ALL STARTED messages\n");
+			
+			//void bank_robbery(void * parent_data, local_id max_id)
+			printf("Starting bank robbery\n");
+			bank_robbery(&currentID, chProcAmount);
+
+			printf("PARENT sending STOP messages to childes\n");
+			Message stopMsg = {{MESSAGE_MAGIC, 0, STOP, get_physical_time()}, };
+			send_multicast (&currentID, &stopMsg);
+
+			for(int i = 1; i <= chProcAmount; i++)
+			{//currentID = 0		
+				if(receive(&currentID, i, &msg) == DONE)
+				{
+					countDone++;		//увеличение счетчика сообщений BALANCE_HISTORY от доч. проц.
+					printf("PARENT received %s from CHILD %d\n", messageType[msg.s_header.s_type], i);
+				}
+			}
+			
+			//Проверка получения DONE от всех дочерних процессов
+			if(countDone == chProcAmount)
+			{
+				WriteEventLog(log_received_all_done_fmt, fileEv, get_physical_time (), currentID);
+				printf("PARENT received ALL DONE messages\n");
+
+				printf("Getting Balance History from childes\n");
+				//Получение BALANCE_HISTORY сообщений от дочерних процессов
+				allHistory.s_history_len = chProcAmount;
+				
+				for(int i = 1; i <= chProcAmount; i++)
+				{//currentID = 0		
+					if(receive(&currentID, i, &msg) == BALANCE_HISTORY)
+					{
+						countHistory++;		//увеличение счетчика сообщений BALANCE_HISTORY от доч. проц.
+						printf("PARENT received %s from CHILD %d\n", messageType[msg.s_header.s_type], i);
+						//tmpHistory = (BalanceHistory)msg.s_payload;
+						memcpy(&allHistory.s_history[i - 1], msg.s_payload, msg.s_header.s_payload_len);
+
+						//printf("+ %d + Len = %d\n", tmpHistory->s_id, tmpHistory->s_history_len);
+						printf("+ %d + Len = %d\n", allHistory.s_history[i - 1].s_id, allHistory.s_history[i - 1].s_history_len);
+						
+						for(int k = 0; k < allHistory.s_history[i - 1].s_history_len; k++)
+							printf("+ %d + Balance = %d, time = %d\n", allHistory.s_history[i - 1].s_id, 
+						       allHistory.s_history[i - 1].s_history[k].s_balance, allHistory.s_history[i - 1].s_history[k].s_time);
+
+						//allHistory.s_history[i - 1] = *tmpHistory;
+					}
+				}
+				
+				if(countHistory == chProcAmount)
+				{
+					printf("PARENT received all %s messages\n", messageType[msg.s_header.s_type]);
+
+					for(int i = 0; i < chProcAmount; i++)
+					{			
+						if(waitpid(childPID[i], NULL, 0) == -1)	//Ожидание окончания всех дочерних процессов
+						{
+							printf("Error waiting child %d\n", i);
+							exit(EXIT_FAILURE);
+						}
+						else
+						{	//в done содержится статус выхода из дочернего процесса
+							//при успешном завершении доч. проц. в done будет 0
+							if(WEXITSTATUS(done) == SUCCESS)	//
+							{
+								printf("Child %i ended\n", i);
+							}
+						}			
+					}
+					print_history (&allHistory);
+
+					//Запись в лог-файл об окончании работы родительского процесса
+					WriteEventLog(log_done_fmt, fileEv, get_physical_time (), currentID, 0);
+					printf("Parent process has DONE");
+					
+					fclose (filePipe);
+					fclose(fileEv);	
+					
+					return SUCCESS;
+				}
+			}
+		}
+		return UNSUCCESS;
+	}
+}
+/*
+ * Проверка атрибута после симвода 'p'
+ */
+int CheckOptionAndGetValue(int argc, char *argv[])
+{
+	int option;
+	int childAmount = 0;
+	while((option = getopt(argc, argv, "p:")) != UNSUCCESS)	//"p:" - двоеточие говорит, что p обязателен
+	{
+		switch(option)	//getopt возвращает символ аргумента, а optarg хранит значение аргумента
+		{				//то есть optarg количество доч. процессов
+			case('p'):
+			{
+				printf("p Argumnet %s\n%d\n", optarg, argc);
+				if((childAmount = atoi(optarg)) == 0)
+				{
+					printf("Incorrect 'child process amount' value");
+					return UNSUCCESS;
+				}
+				else if(childAmount > MAX_PROCESS_ID)	//Если число выше MAX_PROCESS_ID (15)...
+				{
+					printf("'child process amount' couldnt be more than %d", MAX_PROCESS_ID); 
+					childAmount = MAX_PROCESS_ID;		//... то установить количество доч. проц. равным MAX_PROCESS_ID
+				}
+				else 
+				{
+					//Ошибок нет, считаем количество аргументов после -p
+					if(childAmount == argc - 3)	//argv[0]=main.exe, argv[1]=-p, argv[2]=childAmount, argv[3]=баланс_1 и т.д.
+					{
+						for(int i = 3; i < argc; i++)
+						{
+							if(IsOnlyDigits(argv[i]) == SUCCESS)
+								pidBalance[i - 2] = atoi(argv[i]);
+							else
+							{
+								printf("Incorrect input number\n");
+								return UNSUCCESS;
+							}
+							//printf("%d) %d", i-2, pidBalance[i - 2]);
+						}
+					}
+					else
+					{
+						printf("Incorrect number of arguments after -p\n");
+						return UNSUCCESS;
+					}
+				}
+				break;			
+			}				
+			case('?'): printf("Option -p needs an argument"); return UNSUCCESS;
+			default: printf("No such option"); return UNSUCCESS;
+		}
+	}
+	return childAmount;
+}
+
+void CreatePipes(int procAmount, FILE * file)
+{
+	int countPipes = 0;		//счетчик активных/созданных/используемых каналов
+	int flag;
+	for(int i = 0; i <= procAmount; i++)	//Всего каналов надо ([количество доч. проц.] + 1)*2
+	{
+		for(int j = 0; j <= procAmount; j++)
+		{
+			
+			if(i != j)		//pipe[i][i] внутри одного процесса не нужны
+			{
+				//if(pipe2(pipes[i][j].field, O_NONBLOCK) == -1)	//Ошибка при создании канала
+				if(pipe(pipes[i][j].field) == -1)	//Ошибка при создании канала
+				{
+
+					
+					printf("Error on creating pipe %d -> %d. Exiting...\n", i, j);
+					exit(0);
+				}
+				else
+				{
+					flag = fcntl(pipes[i][j].field[READ], F_GETFL, 0);
+					fcntl(pipes[i][j].field[READ], F_SETFL, flag | O_NONBLOCK);
+
+					flag = fcntl(pipes[i][j].field[WRITE], F_GETFL, 0);
+					fcntl(pipes[i][j].field[WRITE], F_SETFL, flag | O_NONBLOCK);
+
+					if(fprintf(file, "Pipe from %d to %d created, R: %d  W: %d\n",
+						   i, j, pipes[i][j].field[READ], pipes[i][j].field[WRITE]) == 0)
+					{
+						printf("Error writing on \"%s\" pipe[%d][%d]", pipes_log, i, j);
+					}
+
+					printf("Pipe from ch[%d] to ch[%d] created, R: %d  W: %d\n",
+						   i, j, pipes[i][j].field[READ], pipes[i][j].field[WRITE]);
+					
+					countPipes++;	//увеличение счетчика при успешном создании канала
+				}
+			}
+		}
+	}
+	printf("%d Pipes created\n", countPipes);
+}
+
+/*
+ *  text - константные значения сообщений из файла "pa1.h"
+ *  file - дескриптор открытого лог-файла (сделать проверку)
+ */
+void WriteEventLog(const char *text, FILE *file, ...)
+{	
+	va_list vars;			//Хранит список аргументов после аргумента file
+	va_start(vars, file);	//из библиотеки <stdarg.h>
+	//Применение описано https://metanit.com/cpp/c/5.13.php
+
+	if(vfprintf(file, text, vars) == 0)	//Неуспешная запись в лог-файл
+	{
+		printf ("Error writing on \"event.log\" ");
+		printf(text, vars);
+	}
+	va_end(vars);
+}
+
+void WritePipeLog(FILE *file, int from, int to, char* type, int curPID)
+{ 
+	if(fprintf(file, "Pipe from %d to %d closed to %s in process %d\n", from, to, type, curPID) == 0)
+	{
+		printf("Error writing on \"pipes.log\" closing pipe from %d to %d to %s in process %d\n", from, to, type, curPID);
+	}
+}
+
+char IsOnlyDigits(char* str)
+{
+	for(int i = 0; i < strlen(str); i++)
+	{
+		if(str[i] == '0' ||
+		   str[i] == '1' ||
+		   str[i] == '2' ||
+		   str[i] == '3' ||
+		   str[i] == '4' ||
+		   str[i] == '5' ||
+		   str[i] == '6' ||
+		   str[i] == '7' ||
+		   str[i] == '8' ||
+		   str[i] == '9')
+			return SUCCESS;
+		else
+			return UNSUCCESS;
+	}
+	return UNSUCCESS;
+}
